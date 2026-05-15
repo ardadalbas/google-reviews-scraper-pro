@@ -230,11 +230,6 @@ class GoogleMapsReviewScraper:
     """Playwright async ile paralel, görsel-engelli Google Maps yorum kazıyıcı."""
 
     FIRST_RESULT = "a.hfpxzc"
-    REVIEWS_TAB_CANDIDATES = (
-        "button[aria-label*='Yorumlar' i]",
-        "button[aria-label*='reviews' i]",
-        "button[jsaction*='reviewChart']",
-    )
     REVIEWS_FEED = "div[role='feed']"
     REVIEW_CARD = "div[data-review-id]"
     REVIEW_TEXT_SELECTORS = (".wiI7pd", ".MyEned")
@@ -337,13 +332,20 @@ class GoogleMapsReviewScraper:
             log.debug("Consent diyaloğu işlenemedi (atlanıyor)")
 
     async def _open_reviews_section(self, page: Page) -> None:
-        for sel in self.REVIEWS_TAB_CANDIDATES:
+        """Yeni Maps UI'da 'Yorumlar' bir role=tab. Tab hiç yoksa bu place'in
+        yorumu yok demektir (Maps sıfır-yorumlu yerlerde sekmeyi gizliyor) —
+        feed.wait_for sonradan zaten 6s'de timeout olup atlanacak."""
+        candidates = (
+            page.get_by_role("tab", name=re.compile(r"Yorumlar|Reviews", re.I)),
+            page.locator("button[role='tab']:has-text('Yorumlar')"),
+            page.locator("[role='tab']:has-text('Yorumlar')"),
+        )
+        for loc in candidates:
             try:
-                await page.locator(sel).first.click(timeout=3_000)
+                await loc.first.click(timeout=2_500)
                 return
             except PlaywrightTimeout:
                 continue
-        # Sekme yok → yorumlar muhtemelen inline görünür
 
     async def _scroll_feed(self, page: Page, feed: Locator) -> None:
         for i in range(SCROLL_MAX_ROUNDS):
