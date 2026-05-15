@@ -45,7 +45,6 @@ from typing import Optional
 import requests
 from playwright.async_api import (
     Browser,
-    Locator,
     Page,
     Route,
     TimeoutError as PlaywrightTimeout,
@@ -231,12 +230,6 @@ class GoogleMapsReviewScraper:
 
     FIRST_RESULT = "a.hfpxzc"
     REVIEW_CARD = "div[data-review-id]"
-    REVIEW_TEXT_SELECTORS = (".wiI7pd", ".MyEned")
-    REVIEW_DATE_SELECTORS = (".rsqaWe", ".DU9Pgb .xRkPPb")
-    EXPAND_MORE = (
-        "button[aria-label='Daha fazla'], "
-        "button[jsaction*='expandReview']"
-    )
     CONSENT_BUTTON = "form[action*='consent'] button"
 
     def __init__(self, concurrency: int = CONCURRENCY):
@@ -390,57 +383,52 @@ class GoogleMapsReviewScraper:
                 return
 
     async def _expand_long_reviews(self, page: Page) -> None:
-        buttons = page.locator(self.EXPAND_MORE)
-        count = await buttons.count()
-        for i in range(count):
-            try:
-                await buttons.nth(i).click(timeout=800)
-            except PlaywrightTimeout:
-                continue
+        """Tüm 'Daha fazla' butonlarını tek JS çağrısında tıkla - per-button
+        Playwright click 178 kartta 2 dakika sürerdi."""
+        await page.evaluate(
+            """() => {
+                const sel = "button[aria-label='Daha fazla'], "
+                          + "button[jsaction*='expandReview']";
+                document.querySelectorAll(sel).forEach(b => b.click());
+            }"""
+        )
 
     async def _collect_reviews(
         self, page: Page, dealer: Dealer, known_ids: set[str]
     ) -> list[Review]:
-        cards = page.locator(self.REVIEW_CARD)
-        total = await cards.count()
-        log.info("[%s] %d yorum kartı bulundu", dealer.name, total)
+        """Tüm kart verisini tek JS evaluate'le çek - per-card Playwright
+        sorgusu 178 kartta ~90 saniye sürerken bu yaklaşık 200 ms."""
+        raw = await page.evaluate(
+            """() => {
+                const cards = document.querySelectorAll('div[data-review-id]');
+                return Array.from(cards).map(c => ({
+                    id: c.getAttribute('data-review-id'),
+                    text: (c.querySelector('.wiI7pd, .MyEned')?.innerText || '').trim(),
+                    date: (c.querySelector('.rsqaWe, .DU9Pgb .xRkPPb')?.innerText || '').trim(),
+                }));
+            }"""
+        )
+        log.info("[%s] %d yorum kartı bulundu", dealer.name, len(raw))
 
         results: list[Review] = []
-        for i in range(total):
-            card = cards.nth(i)
-            rid = await card.get_attribute("data-review-id")
+        for r in raw:
+            rid = r.get("id")
             if not rid or rid in known_ids:
                 continue
-
-            raw_text = await self._first_inner_text(card, self.REVIEW_TEXT_SELECTORS)
-            if not raw_text:
+            text = r.get("text") or ""
+            if not text:
                 continue
-            filtered = ReviewFilter.filter_text(raw_text)
+            filtered = ReviewFilter.filter_text(text)
             if not filtered:
                 continue
-
-            date = await self._first_inner_text(card, self.REVIEW_DATE_SELECTORS) or ""
             results.append(Review(
                 id=rid,
                 dealer_name=dealer.name,
                 dealer_location=dealer.address,
                 review_text=filtered,
-                review_date=date,
+                review_date=r.get("date") or "",
             ))
         return results
-
-    @staticmethod
-    async def _first_inner_text(
-        card: Locator, selectors: tuple[str, ...]
-    ) -> Optional[str]:
-        for sel in selectors:
-            try:
-                txt = await card.locator(sel).first.inner_text(timeout=600)
-                if txt.strip():
-                    return txt.strip()
-            except PlaywrightTimeout:
-                continue
-        return None
 
 
 # ============================================================
