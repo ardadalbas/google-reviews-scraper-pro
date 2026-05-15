@@ -7,27 +7,27 @@ inci_aku_scraper.py
 "inci akü" geçen cümleleri çıkarır ve artımlı olarak JSON'a yazar.
 
 Mimari (4 aşama):
-    1. DealerListScraper       - inciaku.com bayi listesi (requests + BS4)
+    1. DealerAPIFetcher        - inciaku.com JSON API (requests)
     2. GoogleMapsReviewScraper - Playwright async, paralel, görsel-engelli
     3. ReviewFilter            - regex cümle bazlı "inci akü" filtresi
     4. IncrementalStore        - data-review-id ile dedupe, atomic JSON write
 
 KURULUM
 -------
-    pip install requests beautifulsoup4 playwright
+    pip install requests playwright
     playwright install chromium
 
 ÇALIŞTIRMA
 ----------
     python inci_aku_scraper.py
 
-VARSAYIMLAR (üst bölümdeki sabitleri gerekirse güncelle)
----------------------------------------------------------
-- inciaku.com static HTML döndürür. WAF/CDN doğrulaması yapılmadı; HTTP 403
-  alınırsa BROWSER_UA güncellenmeli ya da bu aşama da Playwright'a alınmalı.
-- Bayi kart selector'ları (CARD_SELECTORS) sayfa görülmeden defansif yazıldı;
-  ilk eşleşen kullanılır, hiçbiri tutmazsa log uyarır.
-- Search query = "{Bayi Adı} {Konum}". İlk sonuç doğru bayi varsayılır.
+KAYNAK
+------
+- Bayi listesi: GET https://www.inciaku.com/clockwork/surface/bayiler/Get
+  (sitenin kendi JS'i bu endpoint'ten yüklüyor; HTML scraping yerine direkt
+  JSON kullanıyoruz - hem daha hızlı hem stabil).
+  Alanlar: FirmaAdi, Adres, Telefon, Turu, Enlem, Boylam, Name
+- Maps eşleştirme: telefon ile arama (primary), telefon boşsa adres (fallback).
 - Unique review ID = Google'ın `data-review-id` attribute'ü (stabil).
 - CONCURRENCY=5: 300 bayi için makul başlangıç; CPU/ağ'a göre tune et.
 """
@@ -42,7 +42,6 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
 from playwright.async_api import (
     Browser,
     Locator,
@@ -56,7 +55,8 @@ from playwright.async_api import (
 # ============================================================
 # Configuration
 # ============================================================
-DEALER_URL = "https://www.inciaku.com/tr/bayiler-ve-servisler/"
+DEALERS_API = "https://www.inciaku.com/clockwork/surface/bayiler/Get"
+DEALERS_REFERER = "https://www.inciaku.com/tr/bayiler-ve-servisler/"
 OUTPUT_FILE = Path("inci_aku_yorumlari.json")
 MAPS_SEARCH_URL = "https://www.google.com/maps/search/{q}?hl=tr"
 
@@ -87,11 +87,19 @@ log = logging.getLogger("inci")
 @dataclass(frozen=True)
 class Dealer:
     name: str
-    location: str
+    address: str
+    phone: str
+    service_type: str = ""
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
     @property
     def search_query(self) -> str:
-        return f"{self.name} {self.location}"
+        """Maps arama önceliği: telefon → adres."""
+        phone_digits = re.sub(r"\D", "", self.phone)
+        if len(phone_digits) >= 10:
+            return phone_digits
+        return self.address
 
 
 @dataclass
@@ -104,74 +112,85 @@ class Review:
 
 
 # ============================================================
-# Stage 1: Bayi listesi (requests + BeautifulSoup)
+# Stage 1: Bayi listesi (inciaku.com JSON API)
 # ============================================================
-class DealerListScraper:
-    """inciaku.com'dan bayi adı ve il/ilçe bilgisini çeker."""
-
-    CARD_SELECTORS = (
-        ".bayi-card",
-        ".dealer-card",
-        ".servis-item",
-        ".bayilik .col",
-        "[class*='bayi']",
-    )
-    NAME_SELECTORS = (".name", ".bayi-adi", ".title", "h3", "h4", "strong")
-    LOC_SELECTORS = (".location", ".adres", ".il-ilce", ".sehir", "p")
+class DealerAPIFetcher:
+    """inciaku.com'un site içi JSON endpoint'inden bayileri çeker."""
 
     HEADERS = {
         "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+        "Referer": DEALERS_REFERER,
+        "X-Requested-With": "XMLHttpRequest",
     }
 
-    def __init__(self, url: str = DEALER_URL):
+    def __init__(self, url: str = DEALERS_API):
         self.url = url
 
     def fetch(self) -> list[Dealer]:
-        resp = requests.get(self.url, headers=self.HEADERS, timeout=20)
+        resp = requests.get(
+            self.url,
+            params={"kategori": "", "sehir": "", "ilce": "", "turu": ""},
+            headers=self.HEADERS,
+            timeout=30,
+        )
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        cards = self._find_cards(soup)
-        if not cards:
-            log.error(
-                "Bayi kartı bulunamadı. Sayfayı inceleyip CARD_SELECTORS "
-                "listesini gerçek HTML class'larına göre güncelle."
-            )
+        raw = resp.json()
+        if not isinstance(raw, list):
+            log.error("Beklenmeyen API cevabı: %r", type(raw))
             return []
 
         dealers: list[Dealer] = []
-        seen: set[tuple[str, str]] = set()
-        for card in cards:
-            name = self._first_text(card, self.NAME_SELECTORS)
-            loc = self._first_text(card, self.LOC_SELECTORS)
-            if not name or not loc:
+        seen: set[str] = set()
+        for item in raw:
+            d = self._parse_item(item)
+            if not d:
                 continue
-            key = (name, loc)
+            key = f"{d.name}|{d.phone}|{d.address}"
             if key in seen:
                 continue
             seen.add(key)
-            dealers.append(Dealer(name=name, location=loc))
+            dealers.append(d)
 
-        log.info("Bayi listesi: %d kayıt", len(dealers))
+        log.info("Bayi listesi (API): %d kayıt", len(dealers))
         return dealers
 
-    def _find_cards(self, soup: BeautifulSoup) -> list:
-        for sel in self.CARD_SELECTORS:
-            found = soup.select(sel)
-            if found:
-                log.info("Bayi selector eşleşti: %s (%d kart)", sel, len(found))
-                return found
-        return []
+    @staticmethod
+    def _parse_item(item: dict) -> Optional[Dealer]:
+        name = (item.get("FirmaAdi") or "").strip()
+        address = (item.get("Adres") or "").strip()
+        phone = (item.get("Telefon") or "").strip()
+        if not name or not (phone or address):
+            return None
+        return Dealer(
+            name=name,
+            address=address,
+            phone=phone,
+            service_type=(item.get("Turu") or "").strip(),
+            lat=DealerAPIFetcher._coord(item.get("Enlem")),
+            lng=DealerAPIFetcher._coord(item.get("Boylam")),
+        )
 
     @staticmethod
-    def _first_text(node, selectors: tuple[str, ...]) -> Optional[str]:
-        for sel in selectors:
-            el = node.select_one(sel)
-            if el and (txt := el.get_text(" ", strip=True)):
-                return txt
-        return None
+    def _coord(raw: object) -> Optional[float]:
+        """API koordinatları noktasız döndürüyor (örn '41022287' → 41.022287)."""
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        if "." in s:
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        if len(s) < 3:
+            return None
+        try:
+            return float(s[:2] + "." + s[2:])
+        except ValueError:
+            return None
 
 
 # ============================================================
@@ -348,7 +367,7 @@ class GoogleMapsReviewScraper:
             results.append(Review(
                 id=rid,
                 dealer_name=dealer.name,
-                dealer_location=dealer.location,
+                dealer_location=dealer.address,
                 review_text=filtered,
                 review_date=date,
             ))
@@ -402,7 +421,7 @@ class IncrementalStore:
 # ============================================================
 class Pipeline:
     def __init__(self):
-        self.dealers = DealerListScraper()
+        self.dealers = DealerAPIFetcher()
         self.maps = GoogleMapsReviewScraper()
         self.store = IncrementalStore()
 
