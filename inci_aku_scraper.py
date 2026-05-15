@@ -59,7 +59,6 @@ from playwright.async_api import (
 DEALERS_API = "https://www.inciaku.com/clockwork/surface/bayiler/Get"
 DEALERS_REFERER = "https://www.inciaku.com/tr/bayiler-ve-servisler/"
 OUTPUT_FILE = Path("inci_aku_yorumlari.json")
-MAPS_SEARCH_URL = "https://www.google.com/maps/search/{q}?hl=tr"
 
 KEYWORD_RE = re.compile(r"inci\s*akü", re.IGNORECASE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -103,11 +102,19 @@ class Dealer:
 
     @property
     def search_query(self) -> str:
-        """Maps arama önceliği: telefon → adres."""
-        phone_digits = re.sub(r"\D", "", self.phone)
-        if len(phone_digits) >= 10:
-            return phone_digits
-        return self.address
+        """Maps doğal-dil araması: firma adı + tam adres."""
+        parts = [p.strip() for p in (self.name, self.address) if p and p.strip()]
+        return " ".join(parts)
+
+    @property
+    def maps_url(self) -> str:
+        """API'den gelen lat/lng URL'in @-kısmına bindirilir → Maps aramayı o
+        bölgeye odaklar, fuzzy match isabet oranı dramatik artar."""
+        q = urllib.parse.quote(self.search_query)
+        base = "https://www.google.com/maps/search/"
+        if self.lat is not None and self.lng is not None:
+            return f"{base}{q}/@{self.lat},{self.lng},15z?hl=tr"
+        return f"{base}{q}?hl=tr"
 
 
 @dataclass
@@ -300,8 +307,7 @@ class GoogleMapsReviewScraper:
     async def _scrape_dealer(
         self, page: Page, dealer: Dealer, known_ids: set[str]
     ) -> list[Review]:
-        url = MAPS_SEARCH_URL.format(q=urllib.parse.quote(dealer.search_query))
-        await page.goto(url, wait_until="domcontentloaded")
+        await page.goto(dealer.maps_url, wait_until="domcontentloaded")
         await self._handle_consent(page)
 
         # Çoklu sonuç gelirse listede ilkini tıkla; tek sonuç direkt detay açar
