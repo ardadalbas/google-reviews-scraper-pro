@@ -248,7 +248,18 @@ class GoogleMapsReviewScraper:
             finally:
                 await browser.close()
 
-        return [r for batch in batches for r in batch]
+        # Run-içi dedupe: API'de aynı bayi birden fazla kategori entry'siyle
+        # gelebiliyor; bunların Maps search'i yanlış yere düşüp (geo-bias) aynı
+        # yorumu birden çok bayiden çekebiliyor. ID bazında tekleştir.
+        seen: set[str] = set(known_ids)
+        merged: list[Review] = []
+        for batch in batches:
+            for r in batch:
+                if r.id in seen:
+                    continue
+                seen.add(r.id)
+                merged.append(r)
+        return merged
 
     async def _scrape_one(
         self, browser: Browser, dealer: Dealer, known_ids: set[str]
