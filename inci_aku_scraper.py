@@ -35,6 +35,7 @@ KAYNAK
 import asyncio
 import json
 import logging
+import os
 import re
 import urllib.parse
 from dataclasses import asdict, dataclass
@@ -65,8 +66,15 @@ SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 CONCURRENCY = 5
 NAV_TIMEOUT_MS = 30_000
+FEED_WAIT_MS = 6_000
 SCROLL_MAX_ROUNDS = 15
 SCROLL_GROW_TIMEOUT_MS = 2_500
+
+# Debug env vars (PowerShell: $env:INCI_HEADED=1; py inci_aku_scraper.py)
+HEADLESS = os.environ.get("INCI_HEADED") != "1"
+SLOW_MO = int(os.environ.get("INCI_SLOWMO") or "0")
+DEALER_LIMIT = int(os.environ.get("INCI_LIMIT") or "0")
+DEBUG_DIR = Path("debug")
 
 BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -237,7 +245,7 @@ class GoogleMapsReviewScraper:
         self, dealers: list[Dealer], known_ids: set[str]
     ) -> list[Review]:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
+            browser = await pw.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
             try:
                 tasks = [
                     self._scrape_one(browser, d, known_ids) for d in dealers
@@ -262,12 +270,25 @@ class GoogleMapsReviewScraper:
                 log.warning(
                     "Timeout [%s]: %s", dealer.name, str(e).splitlines()[0]
                 )
+                await self._snapshot(page, dealer)
                 return []
             except Exception as e:
                 log.warning("Hata [%s]: %s", dealer.name, e)
+                await self._snapshot(page, dealer)
                 return []
             finally:
                 await ctx.close()
+
+    @staticmethod
+    async def _snapshot(page: Page, dealer: Dealer) -> None:
+        try:
+            DEBUG_DIR.mkdir(exist_ok=True)
+            safe = re.sub(r"[^\w\-]+", "_", dealer.name)[:50]
+            path = DEBUG_DIR / f"{safe}.png"
+            await page.screenshot(path=str(path), full_page=False)
+            log.info("Screenshot kaydedildi: %s", path)
+        except Exception:
+            pass  # debug yardımcısı, asıl akışı engellemesin
 
     @staticmethod
     async def _block_heavy(route: Route) -> None:
@@ -294,7 +315,7 @@ class GoogleMapsReviewScraper:
         await self._open_reviews_section(page)
 
         feed = page.locator(self.REVIEWS_FEED)
-        await feed.wait_for(timeout=12_000)
+        await feed.wait_for(timeout=FEED_WAIT_MS)
 
         await self._scroll_feed(page, feed)
         await self._expand_long_reviews(page)
@@ -437,6 +458,10 @@ class Pipeline:
         if not dealers:
             log.error("Bayi listesi boş; çıkılıyor.")
             return
+
+        if DEALER_LIMIT > 0:
+            log.info("DEBUG: INCI_LIMIT=%d, ilk %d bayi taranacak", DEALER_LIMIT, DEALER_LIMIT)
+            dealers = dealers[:DEALER_LIMIT]
 
         new_reviews = await self.maps.scrape_all(dealers, known_ids)
         log.info("Filtrelenmiş yeni yorum: %d", len(new_reviews))
