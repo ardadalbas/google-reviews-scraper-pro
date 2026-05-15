@@ -139,6 +139,8 @@ class Dealer:
     address: str
     phone: str
     service_type: str = ""
+    city: str = ""
+    district: str = ""
     lat: Optional[float] = None
     lng: Optional[float] = None
 
@@ -163,6 +165,8 @@ class Dealer:
 class Review:
     id: str
     dealer_name: str
+    dealer_city: str
+    dealer_district: str
     dealer_location: str
     review_text: str
     review_date: str
@@ -225,6 +229,15 @@ class DealerAPIFetcher:
             address=address,
             phone=phone,
             service_type=(item.get("Turu") or "").strip(),
+            # API'nin filter UI'sında sehir/ilce dropdown'ları var → response'da
+            # da bu alanların olması muhtemel. Alternatif key adları (Il / İlce)
+            # için yedek lookup; hiçbiri yoksa boş string kalır.
+            city=(
+                item.get("Sehir") or item.get("Il") or item.get("City") or ""
+            ).strip(),
+            district=(
+                item.get("Ilce") or item.get("İlce") or item.get("District") or ""
+            ).strip(),
             lat=DealerAPIFetcher._coord(item.get("Enlem")),
             lng=DealerAPIFetcher._coord(item.get("Boylam")),
         )
@@ -461,6 +474,8 @@ class GoogleMapsReviewScraper:
         # list.append GIL altında atomic - lock gerekmez)
         self.mismatches.append({
             "dealer_name": dealer.name,
+            "dealer_city": dealer.city,
+            "dealer_district": dealer.district,
             "dealer_address": dealer.address,
             "dealer_phone": dealer.phone,
             "dealer_phone_normalized": api_norm,
@@ -556,6 +571,8 @@ class GoogleMapsReviewScraper:
             results.append(Review(
                 id=rid,
                 dealer_name=dealer.name,
+                dealer_city=dealer.city,
+                dealer_district=dealer.district,
                 dealer_location=dealer.address,
                 review_text=filtered,
                 review_date=r.get("date") or "",
