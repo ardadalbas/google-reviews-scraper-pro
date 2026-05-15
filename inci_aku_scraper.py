@@ -87,6 +87,25 @@ logging.basicConfig(
 log = logging.getLogger("inci")
 
 
+def normalize_phone(raw: str) -> str:
+    """Telefonu sadece rakamlara indirger, ülke kodu (90) ve baştaki 0'ı atar.
+    Türk numaraları için son 10 hane hep eşit olmalı."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("90"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    return digits
+
+
+def phones_match(a: str, b: str) -> bool:
+    """İki telefonun son 10 hanesi aynıysa True."""
+    da, db = normalize_phone(a), normalize_phone(b)
+    if not da or not db:
+        return False
+    return da[-10:] == db[-10:]
+
+
 # ============================================================
 # Models
 # ============================================================
@@ -329,6 +348,12 @@ class GoogleMapsReviewScraper:
         except PlaywrightTimeout:
             pass
 
+        # Telefon eşleştirme: Maps'in açtığı place'in telefonu API'deki
+        # bayi telefonuyla aynı mı? Aynı değilse Maps yanlış yere düşmüş
+        # demektir (geo-bias / fuzzy match yanlışı) - yorumları çekme.
+        if not await self._verify_dealer(page, dealer):
+            return []
+
         await self._open_reviews_section(page)
 
         # div[role='feed'] generic - Maps'te yorum/öneri/foto feed'leri aynı role
@@ -348,6 +373,53 @@ class GoogleMapsReviewScraper:
             await page.wait_for_url("**/maps/**", timeout=10_000)
         except PlaywrightTimeout:
             log.debug("Consent diyaloğu işlenemedi (atlanıyor)")
+
+    async def _verify_dealer(self, page: Page, dealer: Dealer) -> bool:
+        """Place'in telefonunu API bayi telefonuyla karşılaştır.
+
+        - Match → True (devam et)
+        - Maps'te telefon yok → True (toleranslı, INFO logla)
+        - API'de telefon yok → True (karşılaştıracak şey yok)
+        - Mismatch → False (yanlış place, atla)
+        """
+        if not dealer.phone:
+            return True
+
+        # Place panel'in telefon butonu yüklenene kadar kısa bekle
+        try:
+            await page.locator("button[data-item-id^='phone']").first.wait_for(
+                timeout=3_000
+            )
+        except PlaywrightTimeout:
+            pass  # buton yoksa toleranslı dön
+
+        maps_phone = await page.evaluate(
+            """() => {
+                const sels = [
+                    "button[data-item-id^='phone']",
+                    "button[data-item-id*='phone:tel']",
+                    "[aria-label*='Telefon' i][role='button']",
+                ];
+                for (const s of sels) {
+                    const el = document.querySelector(s);
+                    if (el) return el.getAttribute('aria-label') || el.innerText || '';
+                }
+                return null;
+            }"""
+        )
+
+        if not maps_phone:
+            log.info("[%s] Maps'te telefon yok, toleranslı geçildi", dealer.name)
+            return True
+
+        if phones_match(maps_phone, dealer.phone):
+            return True
+
+        log.info(
+            "[%s] Telefon mismatch (API: %s, Maps: %s) - yanlış place, atlandı",
+            dealer.name, normalize_phone(dealer.phone), normalize_phone(maps_phone),
+        )
+        return False
 
     async def _open_reviews_section(self, page: Page) -> None:
         """Place panelindeki 'Yorumlar' tab'ına tıklar. Tab hiç yoksa bu place'in
