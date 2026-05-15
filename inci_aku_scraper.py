@@ -59,6 +59,7 @@ DEALERS_API = "https://www.inciaku.com/clockwork/surface/bayiler/Get"
 DEALERS_REFERER = "https://www.inciaku.com/tr/bayiler-ve-servisler/"
 OUTPUT_FILE = Path("inci_aku_yorumlari.json")
 MISMATCH_FILE = Path("inci_aku_telefon_uyusmayan_bayiler.json")
+OVERRIDE_FILE = Path("inci_aku_url_duzeltmeleri.json")
 
 KEYWORD_RE = re.compile(r"inci\s*akü", re.IGNORECASE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -105,6 +106,28 @@ def phones_match(a: str, b: str) -> bool:
     if not da or not db:
         return False
     return da[-10:] == db[-10:]
+
+
+def load_url_overrides(path: Path = OVERRIDE_FILE) -> dict[str, str]:
+    """Kullanıcının manuel düzelttiği Maps URL'lerini yükler.
+
+    Format: [{"dealer_name": "...", "maps_url": "..."}, ...]
+
+    Bu dosyayı script asla YAZMAZ - sadece okur. Kullanıcı, mismatch
+    dosyasındaki yanlış eşleşen bayileri buraya doğru URL'leriyle
+    kopyalar. Dosya yoksa veya boşsa override uygulanmaz.
+    """
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    out: dict[str, str] = {}
+    for item in data:
+        name = (item.get("dealer_name") or "").strip()
+        url = (item.get("maps_url") or "").strip()
+        if name and url:
+            out[name] = url
+    return out
 
 
 # ============================================================
@@ -252,9 +275,14 @@ class GoogleMapsReviewScraper:
     REVIEW_CARD = "div[data-review-id]"
     CONSENT_BUTTON = "form[action*='consent'] button"
 
-    def __init__(self, concurrency: int = CONCURRENCY):
+    def __init__(
+        self,
+        concurrency: int = CONCURRENCY,
+        overrides: Optional[dict[str, str]] = None,
+    ):
         self.sem = asyncio.Semaphore(concurrency)
         self.mismatches: list[dict] = []
+        self.overrides = overrides or {}
 
     async def scrape_all(
         self, dealers: list[Dealer], known_ids: set[str]
@@ -330,16 +358,21 @@ class GoogleMapsReviewScraper:
     async def _scrape_dealer(
         self, page: Page, dealer: Dealer, known_ids: set[str]
     ) -> list[Review]:
-        await page.goto(dealer.maps_url, wait_until="domcontentloaded")
+        override_url = self.overrides.get(dealer.name)
+        url = override_url or dealer.maps_url
+        await page.goto(url, wait_until="domcontentloaded")
         await self._handle_consent(page)
 
-        # Çoklu sonuç gelirse listede ilkini tıkla; tek sonuç direkt detay açar
-        try:
-            first = page.locator(self.FIRST_RESULT).first
-            await first.wait_for(timeout=6_000)
-            await first.click()
-        except PlaywrightTimeout:
-            pass  # muhtemelen direkt place detay sayfası
+        # Manuel override yoksa search sonuç listesinde ilkini tıkla.
+        # Override URL direkt /maps/place/... olduğu için ilk-sonuç adımına
+        # gerek yok (ve 6s timeout boşa harcanır).
+        if not override_url:
+            try:
+                first = page.locator(self.FIRST_RESULT).first
+                await first.wait_for(timeout=6_000)
+                await first.click()
+            except PlaywrightTimeout:
+                pass
 
         # Place sayfasının yüklenmesini bekle: URL /maps/search/... iken
         # /maps/place/... olmalı. [role='heading'] search-results filtre
@@ -353,7 +386,8 @@ class GoogleMapsReviewScraper:
         # Telefon eşleştirme: Maps'in açtığı place'in telefonu API'deki
         # bayi telefonuyla aynı mı? Aynı değilse Maps yanlış yere düşmüş
         # demektir (geo-bias / fuzzy match yanlışı) - yorumları çekme.
-        if not await self._verify_dealer(page, dealer):
+        # Override varsa kullanıcı elle onaylamış, telefon kontrolünü atla.
+        if not override_url and not await self._verify_dealer(page, dealer):
             return []
 
         await self._open_reviews_section(page)
@@ -563,8 +597,14 @@ class IncrementalStore:
 # ============================================================
 class Pipeline:
     def __init__(self):
+        overrides = load_url_overrides()
+        if overrides:
+            log.info(
+                "Manuel URL düzeltmesi: %d bayi → telefon kontrolü atlanacak",
+                len(overrides),
+            )
         self.dealers = DealerAPIFetcher()
-        self.maps = GoogleMapsReviewScraper()
+        self.maps = GoogleMapsReviewScraper(overrides=overrides)
         self.store = IncrementalStore()
 
     async def run(self) -> None:
