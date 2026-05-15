@@ -58,6 +58,7 @@ from playwright.async_api import (
 DEALERS_API = "https://www.inciaku.com/clockwork/surface/bayiler/Get"
 DEALERS_REFERER = "https://www.inciaku.com/tr/bayiler-ve-servisler/"
 OUTPUT_FILE = Path("inci_aku_yorumlari.json")
+MISMATCH_FILE = Path("inci_aku_telefon_uyusmayan_bayiler.json")
 
 KEYWORD_RE = re.compile(r"inci\s*akü", re.IGNORECASE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -253,6 +254,7 @@ class GoogleMapsReviewScraper:
 
     def __init__(self, concurrency: int = CONCURRENCY):
         self.sem = asyncio.Semaphore(concurrency)
+        self.mismatches: list[dict] = []
 
     async def scrape_all(
         self, dealers: list[Dealer], known_ids: set[str]
@@ -415,10 +417,23 @@ class GoogleMapsReviewScraper:
         if phones_match(maps_phone, dealer.phone):
             return True
 
+        api_norm = normalize_phone(dealer.phone)
+        maps_norm = normalize_phone(maps_phone)
         log.info(
             "[%s] Telefon mismatch (API: %s, Maps: %s) - yanlış place, atlandı",
-            dealer.name, normalize_phone(dealer.phone), normalize_phone(maps_phone),
+            dealer.name, api_norm, maps_norm,
         )
+        # Manuel inceleme için kayıt (asyncio tek thread'de çalışır,
+        # list.append GIL altında atomic - lock gerekmez)
+        self.mismatches.append({
+            "dealer_name": dealer.name,
+            "dealer_address": dealer.address,
+            "dealer_phone": dealer.phone,
+            "dealer_phone_normalized": api_norm,
+            "maps_place_phone_raw": maps_phone,
+            "maps_place_phone_normalized": maps_norm,
+            "maps_url": dealer.maps_url,
+        })
         return False
 
     async def _open_reviews_section(self, page: Page) -> None:
@@ -572,6 +587,21 @@ class Pipeline:
         new_reviews = await self.maps.scrape_all(dealers, known_ids)
         log.info("Filtrelenmiş yeni yorum: %d", len(new_reviews))
         self.store.save(existing, new_reviews)
+        self._save_mismatches()
+
+    def _save_mismatches(self) -> None:
+        """Telefon eşleşmeyen bayileri ayrı dosyaya yazar (manuel inceleme için)."""
+        if not self.maps.mismatches:
+            log.info("Telefon mismatch: 0 bayi")
+            return
+        tmp = MISMATCH_FILE.with_suffix(MISMATCH_FILE.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(self.maps.mismatches, f, ensure_ascii=False, indent=2)
+        tmp.replace(MISMATCH_FILE)
+        log.info(
+            "Telefon mismatch: %d bayi → %s (Maps URL'leri ile birlikte)",
+            len(self.maps.mismatches), MISMATCH_FILE,
+        )
 
 
 if __name__ == "__main__":
