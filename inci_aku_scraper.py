@@ -115,14 +115,26 @@ def load_url_overrides(path: Path = OVERRIDE_FILE) -> dict[str, str]:
 
     Bu dosyayı script asla YAZMAZ - sadece okur. Kullanıcı, mismatch
     dosyasındaki yanlış eşleşen bayileri buraya doğru URL'leriyle
-    kopyalar. Dosya yoksa veya boşsa override uygulanmaz.
+    kopyalar. Dosya yoksa/boşsa/geçersizse override uygulanmaz, akışı
+    durdurmaz.
     """
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        log.warning("Override dosyası geçersiz JSON, atlandı (%s): %s", path, e)
+        return {}
+    if not isinstance(data, list):
+        log.warning("Override dosyası liste olmalı, atlandı: %s", path)
+        return {}
     out: dict[str, str] = {}
     for item in data:
+        if not isinstance(item, dict):
+            continue
         name = (item.get("dealer_name") or "").strip()
         url = (item.get("maps_url") or "").strip()
         if name and url:
