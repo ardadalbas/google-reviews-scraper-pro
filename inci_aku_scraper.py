@@ -230,7 +230,6 @@ class GoogleMapsReviewScraper:
     """Playwright async ile paralel, görsel-engelli Google Maps yorum kazıyıcı."""
 
     FIRST_RESULT = "a.hfpxzc"
-    REVIEWS_FEED = "div[role='feed']"
     REVIEW_CARD = "div[data-review-id]"
     REVIEW_TEXT_SELECTORS = (".wiI7pd", ".MyEned")
     REVIEW_DATE_SELECTORS = (".rsqaWe", ".DU9Pgb .xRkPPb")
@@ -324,10 +323,12 @@ class GoogleMapsReviewScraper:
 
         await self._open_reviews_section(page)
 
-        feed = page.locator(self.REVIEWS_FEED)
-        await feed.wait_for(timeout=FEED_WAIT_MS)
+        # div[role='feed'] generic - Maps'te yorum/öneri/foto feed'leri aynı role
+        # taşıyor. Doğrudan yorum kartını bekle: false positive yok.
+        cards = page.locator(self.REVIEW_CARD)
+        await cards.first.wait_for(timeout=FEED_WAIT_MS)
 
-        await self._scroll_feed(page, feed)
+        await self._scroll_to_load_all(page)
         await self._expand_long_reviews(page)
         return await self._collect_reviews(page, dealer, known_ids)
 
@@ -356,19 +357,32 @@ class GoogleMapsReviewScraper:
         except PlaywrightTimeout:
             pass
 
-    async def _scroll_feed(self, page: Page, feed: Locator) -> None:
-        for i in range(SCROLL_MAX_ROUNDS):
-            prev = await feed.evaluate("el => el.scrollHeight")
-            await feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+    async def _scroll_to_load_all(self, page: Page) -> None:
+        """Yorum listesinin scrollable parent'ını JS ile dinamik bulur, en alta
+        scroll eder; data-review-id sayısı artmayı bırakana kadar tekrarlar."""
+        scroll_js = """
+            () => {
+                const cards = document.querySelectorAll('div[data-review-id]');
+                if (!cards.length) return false;
+                let el = cards[cards.length - 1].parentElement;
+                while (el && el.scrollHeight - el.clientHeight < 10) {
+                    el = el.parentElement;
+                }
+                if (!el) return false;
+                el.scrollTop = el.scrollHeight;
+                return true;
+            }
+        """
+        for _ in range(SCROLL_MAX_ROUNDS):
+            prev = await page.locator(self.REVIEW_CARD).count()
+            await page.evaluate(scroll_js)
             try:
                 await page.wait_for_function(
-                    f"prev => document.querySelector(\"{self.REVIEWS_FEED}\")"
-                    f".scrollHeight > prev",
+                    "prev => document.querySelectorAll('div[data-review-id]').length > prev",
                     arg=prev,
                     timeout=SCROLL_GROW_TIMEOUT_MS,
                 )
             except PlaywrightTimeout:
-                log.debug("Scroll sonu (tur %d)", i + 1)
                 return
 
     async def _expand_long_reviews(self, page: Page) -> None:
