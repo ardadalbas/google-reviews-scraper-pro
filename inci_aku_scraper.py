@@ -313,6 +313,15 @@ class GoogleMapsReviewScraper:
         except PlaywrightTimeout:
             pass  # muhtemelen direkt place detay sayfası
 
+        # Place panel'in render olmasını bekle (tab bar veya başlık görünene kadar);
+        # bu olmadan _open_reviews_section yanlış elementlere tıklayabiliyor.
+        try:
+            await page.locator(
+                "[role='tablist'], div[role='main'] [role='heading']"
+            ).first.wait_for(timeout=5_000)
+        except PlaywrightTimeout:
+            pass
+
         await self._open_reviews_section(page)
 
         feed = page.locator(self.REVIEWS_FEED)
@@ -332,20 +341,20 @@ class GoogleMapsReviewScraper:
             log.debug("Consent diyaloğu işlenemedi (atlanıyor)")
 
     async def _open_reviews_section(self, page: Page) -> None:
-        """Yeni Maps UI'da 'Yorumlar' bir role=tab. Tab hiç yoksa bu place'in
+        """Place panelindeki 'Yorumlar' tab'ına tıklar. Tab hiç yoksa bu place'in
         yorumu yok demektir (Maps sıfır-yorumlu yerlerde sekmeyi gizliyor) —
-        feed.wait_for sonradan zaten 6s'de timeout olup atlanacak."""
-        candidates = (
-            page.get_by_role("tab", name=re.compile(r"Yorumlar|Reviews", re.I)),
-            page.locator("button[role='tab']:has-text('Yorumlar')"),
-            page.locator("[role='tab']:has-text('Yorumlar')"),
-        )
-        for loc in candidates:
-            try:
-                await loc.first.click(timeout=2_500)
-                return
-            except PlaywrightTimeout:
-                continue
+        feed.wait_for sonradan zaten 6s'de timeout olup atlanacak.
+
+        \\b word-boundary regex'i 'Yorumlar' içeren menü item'larıyla karışmasın
+        diye gerekli; sadece role='tab' elementler içinde arar.
+        """
+        tab = page.locator("[role='tab']").filter(
+            has_text=re.compile(r"\bYorumlar\b|\bReviews\b", re.I)
+        ).first
+        try:
+            await tab.click(timeout=3_000)
+        except PlaywrightTimeout:
+            pass
 
     async def _scroll_feed(self, page: Page, feed: Locator) -> None:
         for i in range(SCROLL_MAX_ROUNDS):
