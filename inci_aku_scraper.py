@@ -79,7 +79,7 @@ BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-HEAVY_RESOURCES = {"image", "media", "font", "stylesheet"}
+HEAVY_RESOURCES = {"image", "media", "font"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -261,7 +261,11 @@ class GoogleMapsReviewScraper:
         self, browser: Browser, dealer: Dealer, known_ids: set[str]
     ) -> list[Review]:
         async with self.sem:
-            ctx = await browser.new_context(user_agent=BROWSER_UA, locale="tr-TR")
+            ctx = await browser.new_context(
+                user_agent=BROWSER_UA,
+                locale="tr-TR",
+                viewport={"width": 1920, "height": 1080},
+            )
             await ctx.route("**/*", self._block_heavy)
             page = await ctx.new_page()
             page.set_default_timeout(NAV_TIMEOUT_MS)
