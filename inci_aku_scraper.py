@@ -312,12 +312,12 @@ class GoogleMapsReviewScraper:
         except PlaywrightTimeout:
             pass  # muhtemelen direkt place detay sayfası
 
-        # Place panel'in render olmasını bekle (tab bar veya başlık görünene kadar);
-        # bu olmadan _open_reviews_section yanlış elementlere tıklayabiliyor.
+        # Place sayfasının yüklenmesini bekle: URL /maps/search/... iken
+        # /maps/place/... olmalı. [role='heading'] search-results filtre
+        # başlıklarıyla da eşleşip erken dönüyordu - URL navigasyonu
+        # place panel'in gerçekten açıldığının kesin kanıtı.
         try:
-            await page.locator(
-                "[role='tablist'], div[role='main'] [role='heading']"
-            ).first.wait_for(timeout=5_000)
+            await page.wait_for_url("**/maps/place/**", timeout=8_000)
         except PlaywrightTimeout:
             pass
 
